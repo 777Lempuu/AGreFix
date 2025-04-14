@@ -1,217 +1,230 @@
 import streamlit as st
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from PIL import Image
-import os
+from sklearn.metrics import classification_report, confusion_matrix
 import gdown
+import os
 
 # Set up the app
 st.set_page_config(page_title="AG News Classifier", layout="wide")
+st.title("AG News Text Classification with ReFixMatch")
 
+# Download model weights from Google Drive
+@st.cache_resource
 def download_model():
-    # URL for the model file
-    url = "https://drive.google.com/uc?id=1GH9voK2QGYeoF7VI5UUaDcZNtXr0ZVHX"
-    output = "AG_ReFix.pt"
+    model_url = "https://drive.google.com/uc?id=1GH9voK2QGYeoF7VI5UUaDcZNtXr0ZVHX"
+    output_path = "AG_ReFix.pt"
     
-    if not os.path.exists(output):
-        with st.spinner("Downloading model... (this may take a few minutes)"):
-            gdown.download(url, output, quiet=False)
-    return output
+    if not os.path.exists(output_path):
+        with st.spinner("Downloading model weights (this may take a few minutes)..."):
+            try:
+                gdown.download(model_url, output_path, quiet=False)
+            except Exception as e:
+                st.error(f"Failed to download model weights: {str(e)}")
+                return False
+    return True
 
+# Load model and tokenizer
 @st.cache_resource
 def load_model():
-    # Download the model if not present
-    model_path = download_model()
+    if not download_model():
+        return None, None
     
-    # Load the model and tokenizer
-    MODEL_NAME = "google/bert_uncased_L-2_H-128_A-2"
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model_name = "google/bert_uncased_L-2_H-128_A-2"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Load your trained model
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=4)
-    model.load_state_dict(torch.load(model_path)['model_state_dict'])
-    
-    return model, tokenizer
+    try:
+        # Load the saved model
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=4)
+        state_dict = torch.load('AG_ReFix.pt', map_location=torch.device('cpu'))
+        model.load_state_dict(state_dict['model_state_dict'])
+        return model, tokenizer
+    except Exception as e:
+        st.error(f"Could not load model: {str(e)}")
+        return None, None
 
-try:
-    model, tokenizer = load_model()
-except Exception as e:
-    st.error(f"Error loading model: {str(e)}")
-    st.stop()
+model, tokenizer = load_model()
 
-# App title and description
-st.title("AG News Text Classification with ReFixMatch")
-st.write("""
-This app classifies news articles into one of 4 categories using a BERT model trained with ReFixMatch.
-The model was trained on the AG News dataset with synonym replacement augmentation.
-""")
+# Define a simple dataset class for inference
+class InferenceDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length=128):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.texts)
+        
+    def __getitem__(self, idx):
+        encoding = self.tokenizer(
+            self.texts[idx],
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        return {
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0)
+        }
 
-# Class labels
+# Class labels for AG News
 class_labels = {
     0: "World",
     1: "Sports",
     2: "Business",
-    3: "Sci/Tech"
+    3: "Science/Tech"
 }
 
-# Sidebar with options
-st.sidebar.header("Options")
-option = st.sidebar.radio("Choose an option:", 
-                         ("Classify Text", "Model Information", "Performance Metrics"))
+# App functionality
+tab1, tab2 = st.tabs(["Single Prediction", "Batch Prediction"])
 
-if option == "Classify Text":
-    st.header("Text Classification")
+with tab1:
+    st.header("Classify a Single News Text")
+    input_text = st.text_area("Enter news text to classify:", height=150, 
+                            placeholder="Paste news article text here...")
     
-    # Input options
-    input_method = st.radio("Input method:", ("Type text", "Paste text"))
-    
-    if input_method == "Type text":
-        user_input = st.text_area("Enter your news text here:", 
-                                "Apple announced a new iPhone model yesterday...")
-    else:
-        user_input = st.text_area("Paste your news text here:", 
-                                "Apple announced a new iPhone model yesterday...")
-    
-    if st.button("Classify"):
-        if user_input.strip() == "":
-            st.warning("Please enter some text to classify.")
+    if st.button("Classify") and input_text:
+        if model is None:
+            st.error("Model not loaded. Please check if the model weights downloaded correctly.")
         else:
             with st.spinner("Classifying..."):
-                # Tokenize input
-                inputs = tokenizer(
-                    user_input,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=128,
-                    return_tensors="pt"
-                )
+                # Create dataset and dataloader
+                dataset = InferenceDataset([input_text], tokenizer)
+                loader = torch.utils.data.DataLoader(dataset, batch_size=1)
                 
-                # Make prediction
+                # Get prediction
+                model.eval()
                 with torch.no_grad():
-                    outputs = model(**inputs)
-                    probs = torch.nn.functional.softmax(outputs.logits, dim=1)
-                    pred_class = torch.argmax(probs).item()
-                    confidence = torch.max(probs).item()
+                    for batch in loader:
+                        inputs = {k: v for k, v in batch.items()}
+                        outputs = model(**inputs)
+                        probs = torch.nn.functional.softmax(outputs.logits, dim=1)
+                        pred_class = torch.argmax(probs).item()
+                        confidence = torch.max(probs).item()
                 
                 # Display results
-                st.subheader("Classification Result")
+                st.subheader("Prediction Result")
                 col1, col2 = st.columns(2)
-                
                 with col1:
                     st.metric("Predicted Class", f"{class_labels[pred_class]} (Class {pred_class})")
                     st.metric("Confidence", f"{confidence:.2%}")
                 
                 with col2:
-                    # Show probabilities
-                    prob_df = pd.DataFrame({
-                        "Class": [class_labels[i] for i in range(4)],
-                        "Probability": probs.squeeze().numpy()
-                    })
-                    
+                    # Show probability distribution
+                    prob_data = {class_labels[i]: probs[0][i].item() for i in range(4)}
                     fig, ax = plt.subplots(figsize=(8, 4))
-                    sns.barplot(data=prob_df, x="Class", y="Probability", ax=ax)
-                    ax.set_ylim(0, 1)
+                    sns.barplot(x=list(prob_data.values()), y=list(prob_data.keys()), palette="Blues_d", ax=ax)
+                    ax.set_xlabel("Probability")
                     ax.set_title("Class Probabilities")
+                    ax.set_xlim(0, 1)
                     st.pyplot(fig)
+
+with tab2:
+    st.header("Classify Multiple News Texts")
+    st.info("Upload a CSV file containing news articles in a column named 'text'")
+    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
+    
+    if uploaded_file:
+        try:
+            df = pd.read_csv(uploaded_file)
+            if 'text' not in df.columns:
+                st.error("Error: CSV file must contain a 'text' column")
+            else:
+                st.success(f"Successfully loaded {len(df)} records")
+                st.dataframe(df.head(3))
                 
-                st.subheader("Processed Text")
-                st.write(user_input)
+                if st.button("Classify All") and model is not None:
+                    with st.spinner(f"Classifying {len(df)} texts..."):
+                        # Create dataset and dataloader
+                        dataset = InferenceDataset(df['text'].tolist(), tokenizer)
+                        loader = torch.utils.data.DataLoader(dataset, batch_size=32)
+                        
+                        # Get predictions
+                        model.eval()
+                        predictions = []
+                        confidences = []
+                        with torch.no_grad():
+                            for batch in loader:
+                                inputs = {k: v for k, v in batch.items()}
+                                outputs = model(**inputs)
+                                probs = torch.nn.functional.softmax(outputs.logits, dim=1)
+                                batch_preds = torch.argmax(probs, dim=1).cpu().numpy()
+                                batch_confs = torch.max(probs, dim=1).values.cpu().numpy()
+                                predictions.extend(batch_preds)
+                                confidences.extend(batch_confs)
+                        
+                        # Add results to dataframe
+                        df['predicted_class'] = predictions
+                        df['predicted_label'] = df['predicted_class'].map(class_labels)
+                        df['confidence'] = confidences
+                        
+                        # Show results
+                        st.subheader("Classification Results")
+                        st.dataframe(df)
+                        
+                        # Download button
+                        csv = df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            "Download Results as CSV",
+                            csv,
+                            "classification_results.csv",
+                            "text/csv",
+                            key='download-csv'
+                        )
+                        
+                        # Show statistics
+                        st.subheader("Prediction Statistics")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write("**Class Distribution**")
+                            fig1, ax1 = plt.subplots(figsize=(6, 4))
+                            sns.countplot(x='predicted_label', data=df, ax=ax1, 
+                                        order=list(class_labels.values()))
+                            ax1.set_title("Predicted Class Distribution")
+                            ax1.set_xlabel("Class")
+                            ax1.set_ylabel("Count")
+                            plt.xticks(rotation=45)
+                            st.pyplot(fig1)
+                        
+                        with col2:
+                            st.write("**Confidence Distribution**")
+                            fig2, ax2 = plt.subplots(figsize=(6, 4))
+                            sns.histplot(df['confidence'], bins=20, kde=True, ax=ax2)
+                            ax2.set_title("Confidence Score Distribution")
+                            ax2.set_xlabel("Confidence")
+                            ax2.set_ylabel("Count")
+                            st.pyplot(fig2)
+        except Exception as e:
+            st.error(f"Error processing file: {str(e)}")
 
-elif option == "Model Information":
-    st.header("Model Information")
-    
-    st.subheader("Model Architecture")
-    st.write("""
-    - **Base Model**: BERT (google/bert_uncased_L-2_H-128_A-2)
-    - **Layers**: 2
-    - **Hidden Size**: 128
-    - **Attention Heads**: 2
-    - **Classification Head**: 4 classes
-    """)
-    
-    st.subheader("Training Details")
-    st.write("""
-    - **Training Method**: ReFixMatch (semi-supervised learning)
-    - **Augmentation**: Synonym replacement using WordNet
-    - **Batch Size**: 32
-    - **Learning Rate**: 5e-5
-    - **Epochs**: 5
-    - **Optimizer**: AdamW with weight decay
-    - **Loss Function**: Cross Entropy Loss
-    """)
-    
-    st.subheader("Dataset Information")
-    st.write("""
-    - **Dataset**: AG News (120,000 training samples, 7,600 test samples)
-    - **Classes**: 
-        - 0: World
-        - 1: Sports
-        - 2: Business
-        - 3: Sci/Tech
-    """)
-
-elif option == "Performance Metrics":
-    st.header("Model Performance Metrics")
-    
-    st.subheader("Test Set Performance")
-    st.write("""
-    Below are the performance metrics of the model on the AG News test set:
-    """)
-    
-    # These would be your actual metrics from evaluation
-    metrics = {
-        "Accuracy": 0.9234,
-        "Precision": 0.9235,
-        "Recall": 0.9234,
-        "F1-Score": 0.9234
-    }
-    
-    # Display metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Accuracy", f"{metrics['Accuracy']:.2%}")
-    col2.metric("Precision", f"{metrics['Precision']:.2%}")
-    col3.metric("Recall", f"{metrics['Recall']:.2%}")
-    col4.metric("F1-Score", f"{metrics['F1-Score']:.2%}")
-    
-    # Confusion matrix (example)
-    st.subheader("Confusion Matrix")
-    cm = np.array([[2231,   22,   15,   32],
-                  [  15, 2291,    8,   16],
-                  [  42,   17, 2181,   20],
-                  [  32,   20,   14, 2234]])
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=class_labels.values(), 
-                yticklabels=class_labels.values(),
-                ax=ax)
-    ax.set_xlabel('Predicted')
-    ax.set_ylabel('True')
-    ax.set_title('Confusion Matrix')
-    st.pyplot(fig)
-    
-    # Classification report
-    st.subheader("Classification Report")
-    st.code("""
-              precision    recall  f1-score   support
-
-           0     0.9619    0.9701    0.9660      2300
-           1     0.9745    0.9833    0.9789      2330
-           2     0.9833    0.9654    0.9743      2260
-           3     0.9706    0.9706    0.9706      2300
-
-    accuracy                         0.9724      9190
-   macro avg     0.9726    0.9724    0.9724      9190
-weighted avg     0.9725    0.9724    0.9724      9190
-    """)
-
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.info("""
-**Note**: This app uses a BERT model fine-tuned on AG News with ReFixMatch.
-The model achieves ~92% accuracy on the test set.
+# Add some info about the model
+st.sidebar.header("About the Model")
+st.sidebar.write("""
+This app uses a BERT-based model fine-tuned on the AG News dataset using ReFixMatch, 
+a semi-supervised learning approach that combines labeled and unlabeled data.
 """)
+
+st.sidebar.header("Class Labels")
+for k, v in class_labels.items():
+    st.sidebar.write(f"**{k}**: {v}")
+
+st.sidebar.header("How to Use")
+st.sidebar.write("""
+1. **Single Prediction**: Paste text and click Classify
+2. **Batch Prediction**: Upload CSV with 'text' column
+""")
+
+if model is None:
+    st.error("Model failed to load. Please check the following:")
+    st.write("- Internet connection for downloading model weights")
+    st.write("- Google Drive link is accessible")
+    st.write("- Sufficient disk space (model is ~60MB)")
+else:
+    st.sidebar.success("Model loaded successfully!")
